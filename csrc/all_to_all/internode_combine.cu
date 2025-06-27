@@ -85,7 +85,7 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void combineKernel(
         const int dstRank = dp * dpSize + i;
         const unsigned index = dstExpert * maxNumTokens + source;
         std::byte *dstPtr = xBufferOut + index * stride;
-        nvshmemx_putmem_signal_nbi_warp(
+        nvshmemx_putmem_signal_nbi_warp( // key: PUT
             dstPtr, xTokenPtr, stride, &combineSignalBuffer[source], 1, NVSHMEM_SIGNAL_ADD, dstRank
         );
       }
@@ -198,7 +198,8 @@ void AllToAllInterNode::combine(
       &combineSyncBuffer,
       &tokenIndex,
       &xCombineIn,
-      &xCombineOut};
+      &xCombineOut
+  };
 
   nvtxRangePush("combine");
   switch (splitMode) {

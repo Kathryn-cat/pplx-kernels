@@ -13,44 +13,57 @@ namespace {
 
 template <unsigned NUM_WARPS, bool DO_SEND, bool DO_RECV>
 __global__ __launch_bounds__(NUM_WARPS * 32, 1) void dispatchKernel(
-    int32_t *outNumTokensPerExpert,
+    int32_t *outNumTokensPerExpert, // OUT: [numLocalExperts], hold number of tokens received for
+                                    // each local expert
     size_t outNumTokensPerExpertStrideElem,
-    std::byte *expertX,
+    std::byte *expertX, // OUT: [numLocalExperts, maxNumTokens * numDPGroups, hiddenDim], actual
+                        // tokens stored
     size_t expertXStrideElem,
     size_t expertXStrideRow,
-    float *expertXScale,
+    float *expertXScale, // OUT: [numLocalExperts, maxNumTokens * numDPGroups, hiddenDimScale], the
+                         // buffer for the quantization scale of the tokens, if used.
     size_t expertXScaleStrideElem,
     size_t expertXScaleStrideRow,
     size_t expertXScaleStrideCol,
-    std::byte *dpX,
+    std::byte *dpX, // IN: [m, hiddenDim], local token data from the local data-parallel (DP) group
     size_t dpXStrideElem,
-    float *dpXScale,
+    float *dpXScale, // IN: [m, hiddenDimScale], the quantization scale for the dpX tokens.
     size_t dpXScaleStrideElem,
     size_t dpXScaleStrideRow,
-    uint32_t *indices,
+    uint32_t *indices, // IN: [m, numExpertsPerToken], the crucial buffer maps each token to its
+                       // destination expert.
     size_t indicesStrideElem,
     size_t indicesStrideRow,
-    size_t maxNumTokens,
-    size_t numExperts,
-    unsigned rank,
-    unsigned worldSize,
-    unsigned dpSize,
-    size_t hiddenDim,
-    size_t hiddenDimScale,
-    size_t numExpertsPerToken,
-    unsigned *boundM,
-    unsigned m,
-    uint32_t *numTokensPerDP,
-    uint32_t *sourceExpert,
-    uint32_t *sourceIndex,
-    uint32_t *sourceOffset,
-    uint32_t *sourceGroup,
-    uint32_t *sourceToken,
-    uint64_t *numTokensBuffer,
-    uint64_t *numRecvBuffer,
+    size_t maxNumTokens,   // CONST: The maximum number of tokens that can be handled in a batch.
+    size_t numExperts,     // CONST: Total number of experts across all nodes/ranks.
+    unsigned rank,         // CONST: Local rank
+    unsigned worldSize,    // CONST: Total number of ranks in the world.
+    unsigned dpSize,       // CONST: DP group size
+    size_t hiddenDim,      // CONST
+    size_t hiddenDimScale, // CONST
+    size_t numExpertsPerToken, // CONST: top K
+    unsigned
+        *boundM, // a pointer to the actual number of tokens in the current batch (dynamic shape).
+    unsigned m,  // CONST: the allocated size
+    uint32_t *numTokensPerDP,  // INTERNAL: [numLocalExperts * numDPGroups], NVSHMEM allocated, Used
+                               // during RECV to temporarily store the count of tokens received from
+                               // each source DP group.
+    uint32_t *sourceExpert,    // INTERNAL: [maxBatchTokens], needed for the combine step later.
+    uint32_t *sourceIndex,     // INTERNAL: [maxBatchTokens], needed for the combine step later.
+    uint32_t *sourceOffset,    // INTERNAL: [maxBatchTokens], needed for the combine step later.
+    uint32_t *sourceGroup,     // INTERNAL: [maxBatchTokens], needed for the combine step later.
+    uint32_t *sourceToken,     // INTERNAL: [maxBatchTokens], needed for the combine step later.
+    uint64_t *numTokensBuffer, // INTERNAL: [numLocalExperts * numDPGroups], NVSHMEM allocated, the
+                               // sender writes the number of tokens it's about to send, and the
+                               // receiver waits on this value.
+    uint64_t *numRecvBuffer,   // INTERNAL: [numLocalExperts * numDPGroups], NVSHMEM allocated, used
+                             // as a counter for RDMA completion. The sender atomically adds to this
+                             // buffer after each put operation. The receiver waits until this
+                             // counter equals the value in numTokensBuffer.
     uint32_t &globalTokenIndex,
-    std::byte *xBufferIn,
-    std::byte *xBufferOut
+    std::byte *
+        xBufferIn, // INTERNAL: NVSHMEM allocated, used by the sender to pack a token before sending
+    std::byte *xBufferOut // INTERNAL: NVSHMEM allocated, receivers find the incoming token data.
 ) {
   // Determine the rank, DP rank and per-rank constants.
   const unsigned numLocalExperts = numExperts / worldSize;
@@ -72,6 +85,7 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void dispatchKernel(
 
   // Zero out the shared memory buffer.
   extern __shared__ std::byte sharedMemory[];
+  // SEND: Sending tokens from the local GPU to remote expert GPUs.
   if constexpr (DO_SEND) {
     uint32_t *tokenIndex = reinterpret_cast<uint32_t *>(sharedMemory);
     for (uint32_t i = threadIdx.x; i < numExperts; i += blockDim.x) {
@@ -79,6 +93,7 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void dispatchKernel(
     }
     __syncthreads();
 
+    // WARP: last one, responsible for counting tokens per expert and signaling the counts.
     if (warpId + 1 == NUM_WARPS) {
       // The experts are split across the available blocks.
       // The warp counts the number of tokens assigned to each expert.
@@ -112,6 +127,7 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void dispatchKernel(
         }
       }
     } else {
+      // WARP: remaining, responsible for the actual data transfer.
       // Send the tokens to the destination ranks through RDMA.
       const unsigned numGroupWarps = NUM_WARPS - 1;
       const unsigned numGroupThreads = numGroupWarps * WARP_SIZE;
@@ -154,7 +170,7 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void dispatchKernel(
             const unsigned loc = group * maxNumTokens + index;
 
             std::byte *destPointer = xBufferOut + loc * tokenStride;
-            nvshmemx_putmem_signal_nbi_warp(
+            nvshmemx_putmem_signal_nbi_warp( // key: PUT
                 destPointer,
                 xInPtr,
                 tokenStride,
@@ -173,6 +189,7 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void dispatchKernel(
     }
   }
 
+  // RECV: Receiving tokens on the expert GPU from all other source GPUs.
   if constexpr (DO_RECV) {
     // Wait for the token counts to be sent.
     const size_t numExpertsAndGroups = numLocalExperts * numDPGroups;
@@ -183,6 +200,7 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void dispatchKernel(
     unsigned firstGroup = blockIdx.x * expertsPerBlock;
     unsigned lastGroup = std::min(firstGroup + expertsPerBlock, numExpertsAndGroups);
 
+    // STAGE 1: meta data
     for (unsigned group = firstGroup + threadIdx.x; group < lastGroup;
          group += gridDim.x * expertsPerBlock) {
       const uint32_t expert = group / numDPGroups;
@@ -223,6 +241,7 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void dispatchKernel(
     cooperative_groups::this_grid().sync();
     unsigned numRecvTokens = globalTokenIndex;
 
+    // STAGE 2: final copy
     for (unsigned i = blockIdx.x; i < numRecvTokens; i += gridDim.x) {
       auto expertLoc = sourceOffset[i];
       auto expert = sourceExpert[i];
