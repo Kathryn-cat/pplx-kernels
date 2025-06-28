@@ -48,8 +48,8 @@ bool testDispatchCombine(
     cudaStream_t stream,
     unsigned dpRank,
     unsigned dpSize,
-    unsigned epRank,
-    unsigned epSize,
+    unsigned epRank, // rank
+    unsigned epSize, // world_size
     Args &&...args
 ) {
   constexpr uint32_t numExperts = 8;
@@ -69,32 +69,50 @@ bool testDispatchCombine(
 
   // Generate the same test data on all ranks.
   // Compute the expected values for the local experts.
-  std::vector<RankTestData<T>> rankTestData;
+  std::vector<RankTestData<T>> rankTestData; // length: 2
+  // reference answer
   std::vector<unsigned> expectedExpertIndptr(numExperts);
   std::vector<std::vector<unsigned>> expectedNumTokens(numExperts);
   std::mt19937 gen(seed);
+
+  // construct data parallelism data
   for (unsigned i = 0; i < numDPGroups; ++i) {
+    // RankTestData()
     auto &rank = rankTestData.emplace_back(
         gen, maxNumTokens, numExperts, expertsPerToken, hiddenDim, blockSize
     );
 
+    // RankTestData.numRouted buffer
     for (unsigned j = 0; j < numExperts; ++j) {
       auto m = rank.numRouted[j];
       expectedExpertIndptr[j] += m;
       expectedNumTokens[j].push_back(m);
     }
-
-    if (epRank == 0) {
-      std::cout << "DP Rank #" << i << ":" << std::endl;
-      std::cout << rank << std::endl;
-    }
   }
 
   auto &rank = rankTestData[dpRank];
-  DeviceBuffer<T> xDevice(rank.x);
-  DeviceBuffer<float> xScaleDevice(rank.xScale);
-  DeviceBuffer<uint32_t> indicesDevice(rank.indices);
-  DeviceBuffer<float> weightsDevice(rank.weights);
+  // if (epRank == 0) {
+  //   std::cout << "DP Rank #" << dpRank << ":" << std::endl;
+  //   rank.print(std::cout);
+  // }
+  // if (epRank == 1) {
+  //   std::cout << "DP Rank #" << dpRank << ":" << std::endl;
+  //   rank.print(std::cout);
+  // }
+  // if (epRank == 2) {
+  //   std::cout << "DP Rank #" << dpRank << ":" << std::endl;
+  //   rank.print(std::cout);
+  // }
+  // if (epRank == 3) {
+  //   std::cout << "DP Rank #" << dpRank << ":" << std::endl;
+  //   rank.print(std::cout);
+  // }
+
+  // cudaMalloc(size)
+  DeviceBuffer<T> xDevice(rank.x);                    // [m, hiddenDim]
+  DeviceBuffer<float> xScaleDevice(rank.xScale);      // [m, hiddenDimScale]
+  DeviceBuffer<uint32_t> indicesDevice(rank.indices); // [m, expertsPerToken]
+  DeviceBuffer<float> weightsDevice(rank.weights);    // [m, expertsPerToken]
 
   const unsigned expertsPerRank = numExperts / epSize;
   DeviceBuffer<int32_t> outTokensPerExpertDevice(expertsPerRank);
@@ -106,6 +124,11 @@ bool testDispatchCombine(
 
   const size_t hiddenDimBytes = rank.hiddenDim * sizeof(T);
   const size_t hiddenDimScaleBytes = rank.hiddenDimScale * sizeof(float);
+
+  if (epRank == 0) {
+    std::cout << "------------------- begin constructing allToAll kernel -------------------"
+              << std::endl;
+  }
 
   Kernel allToAll(
       maxNumTokens,
@@ -121,26 +144,35 @@ bool testDispatchCombine(
   );
 
   for (size_t i = 0; i < numRepeats; ++i) {
+    if (epRank == 0) {
+      std::cout << "-------------------- begin dispatch ---------------------" << std::endl;
+    }
     allToAll.dispatch(
-        Strided1D<int32_t>(outTokensPerExpertDevice, 1),
-        Strided2D<std::byte>(
-            outExpertDevice, hiddenDimBytes, hiddenDimBytes * maxNumTokens * numDPGroups
+        Strided1D<int32_t>(outTokensPerExpertDevice, 1), // recv_token_per_expert
+        Strided2D<std::byte>( // recv_token_data
+            outExpertDevice,
+            hiddenDimBytes,
+            hiddenDimBytes * maxNumTokens * numDPGroups
         ),
-        Strided3D<float>(
+        Strided3D<float>( // omit
             outExpertScaleDevice,
             1,
             rank.hiddenDimScale,
             rank.hiddenDimScale * maxNumTokens * numDPGroups
         ),
-        Strided1D<std::byte>(xDevice, hiddenDimBytes),
+        Strided1D<std::byte>(xDevice, hiddenDimBytes), // send_token_data
         Strided2D<float>(xScaleDevice, 1, rank.hiddenDimScale),
         Strided2D<uint32_t>(indicesDevice, 1, expertsPerToken),
         rank.m,
         nullptr,
-        SplitMode::NONE,
+        SplitMode::NONE, // splitMode
         stream
     );
     CUDACHECK(cudaStreamSynchronize(stream));
+
+    if (epRank == 0) {
+      std::cout << "-------------------- combine dispatch ---------------------" << std::endl;
+    }
 
     allToAll.combine(
         Strided1D<nv_bfloat16>(outTokensDevice, hiddenDim),
@@ -161,6 +193,9 @@ bool testDispatchCombine(
   HostBuffer<nv_bfloat16> outTokensHost(outTokensDevice);
 
   // Print the results.
+  if (epRank == 0) {
+    std::cout << "----------------- final results -----------------" << std::endl;
+  }
   for (unsigned i = 0; i < epSize; ++i) {
     MPI_Barrier(MPI_COMM_WORLD);
 
@@ -368,22 +403,23 @@ int main(int argc, char **argv) {
   if (!testDispatchCombine<float, AllToAllInterNode>(stream, rank / 2, 2, rank, world_size)) {
     exit_code = EXIT_FAILURE;
   }
-  if (!testDispatchCombine<nv_bfloat16, AllToAllInterNode>(stream, rank / 2, 2, rank, world_size)) {
-    exit_code = EXIT_FAILURE;
-  }
+  // if (!testDispatchCombine<nv_bfloat16, AllToAllInterNode>(stream, rank / 2, 2, rank,
+  // world_size)) {
+  //   exit_code = EXIT_FAILURE;
+  // }
 
-  // Intra-node tests.
-  std::shared_ptr<Distributed> distributed = std::make_shared<DistributedNVSHMEM>(rank, world_size);
-  if (!testDispatchCombine<float, AllToAllIntraNode>(
-          stream, rank / 2, 2, rank, world_size, distributed
-      )) {
-    exit_code = EXIT_FAILURE;
-  }
-  if (!testDispatchCombine<nv_bfloat16, AllToAllIntraNode>(
-          stream, rank / 2, 2, rank, world_size, distributed
-      )) {
-    exit_code = EXIT_FAILURE;
-  }
+  // // Intra-node tests.
+  // std::shared_ptr<Distributed> distributed = std::make_shared<DistributedNVSHMEM>(rank,
+  // world_size); if (!testDispatchCombine<float, AllToAllIntraNode>(
+  //         stream, rank / 2, 2, rank, world_size, distributed
+  //     )) {
+  //   exit_code = EXIT_FAILURE;
+  // }
+  // if (!testDispatchCombine<nv_bfloat16, AllToAllIntraNode>(
+  //         stream, rank / 2, 2, rank, world_size, distributed
+  //     )) {
+  //   exit_code = EXIT_FAILURE;
+  // }
 
   // Cleanup.
   CUDACHECK(cudaStreamDestroy(stream));

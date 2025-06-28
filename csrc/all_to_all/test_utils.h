@@ -21,11 +21,12 @@ template <typename T> struct RankTestData {
   const size_t hiddenDimScale;
   const size_t numExperts;
   const size_t expertsPerToken;
+  // buffers start here
   HostBuffer<T> x;
   HostBuffer<float> xScale;
   HostBuffer<uint32_t> indices;
   HostBuffer<float> weights;
-  HostBuffer<uint32_t> numRouted;
+  HostBuffer<uint32_t> numRouted; // only for reference answer
 
   RankTestData(
       std::mt19937 &gen,
@@ -111,25 +112,30 @@ RankTestData<T>::RankTestData(
 }
 
 template <typename T> std::ostream &RankTestData<T>::print(std::ostream &os) const {
-  for (unsigned j = 0; j < m; ++j) {
-    os << "#" << j << " ->";
+  for (unsigned j = 0; j < m; ++j) { // for group 0: m=3. for group 1: m=10
+    os << "m #" << j << std::endl;
+    os << "indices & weights: " << std::endl;
     for (unsigned k = 0; k < expertsPerToken; ++k) {
       auto e = indices[j * expertsPerToken + k];
       auto w = weights[j * expertsPerToken + k];
       os << " " << e << ":" << w;
     }
     os << std::endl;
-    os << "    ";
+    // os << "    ";
+    os << "x: " << std::endl;
     for (unsigned k = 0; k < hiddenDim; ++k) {
       os << (float)x[j * hiddenDim + k] << " ";
     }
     os << std::endl;
-    os << "    ";
+    // os << "    ";
+    os << "xScale: " << std::endl;
     for (unsigned k = 0; k < hiddenDimScale; ++k) {
       os << xScale[j * hiddenDimScale + k] << " ";
     }
     os << std::endl;
   }
+
+  os << "Reference answer for numRouted:" << std::endl;
   for (unsigned j = 0; j < numExperts; ++j) {
     const size_t numTokens = numRouted[j];
     os << "Expert " << j << ": " << numTokens << " tokens" << std::endl;
