@@ -163,18 +163,21 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void dispatchKernel(
           //   printf("rank: %u, blockIdx.x: %u, i: %u\n", rank, blockIdx.x, i);
           // }
           // Copy the token to the symmetric buffer.
+          // GOAL: copy x token to buffer_in
           std::byte *xInPtr = xBufferIn + i * tokenStride;
           const int4 *srcX = (int4 *)(dpX + i * dpXStrideElem);
           for (unsigned d = threadIdx.x; d * sizeof(int4) < hiddenDim; d += numGroupThreads) {
             ((int4 *)xInPtr)[d] = srcX[d];
           }
 
+          // omit in test
           std::byte *xInScalePtr = xInPtr + hiddenDim;
           const float *srcXScale = dpXScale + i * dpXScaleStrideRow;
           for (unsigned d = threadIdx.x; d * sizeof(float) < hiddenDimScale; d += numGroupThreads) {
             ((float *)xInScalePtr)[d] = srcXScale[d * dpXScaleStrideElem];
           }
 
+          // GOAL: store token index
           if (threadIdx.x == 0) {
             *((uint32_t *)(xInPtr + tokenDim)) = i;
           }
@@ -183,6 +186,8 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void dispatchKernel(
           asm volatile("bar.sync 1, %0;" ::"r"(numGroupThreads));
 
           // Send the token to the other ranks, one send per warp.
+          // GOAL: RDMA dispatch
+          // each warp is responsible for one dest expert
           for (unsigned j = warpId; j < numExpertsPerToken; j += numGroupWarps) {
             const uint32_t dstExpert = __ldg(&indices[i * numExpertsPerToken + j]);
             const uint32_t dstRank = dstExpert / numLocalExperts;
@@ -194,13 +199,13 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void dispatchKernel(
 
             std::byte *destPointer = xBufferOut + loc * tokenStride;
             nvshmemx_putmem_signal_nbi_warp( // key: PUT
-                destPointer,
-                xInPtr,
-                tokenStride,
-                &numRecvBuffer[group],
+                destPointer, // dest ptr
+                xInPtr, // src ptr
+                tokenStride, // num of bytes, hidden_dim + scale + 1
+                &numRecvBuffer[group], // signal addr
                 1,
                 NVSHMEM_SIGNAL_ADD,
-                dstRank
+                dstRank // dst rank
             );
           }
         }
@@ -216,17 +221,19 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void dispatchKernel(
   // RECV: Receiving tokens on the expert GPU from all other source GPUs.
   if constexpr (DO_RECV) {
     // Wait for the token counts to be sent.
-    const size_t numExpertsAndGroups = numLocalExperts * numDPGroups;
-    const size_t expertsPerBlock = ceil_div<size_t>(numExpertsAndGroups, gridDim.x);
+    const size_t numExpertsAndGroups = numLocalExperts * numDPGroups;                // test: 4
+    const size_t expertsPerBlock = ceil_div<size_t>(numExpertsAndGroups, gridDim.x); // test: 1
     uint32_t *sharedExpert = reinterpret_cast<uint32_t *>(sharedMemory);
     uint32_t *sharedToken = sharedExpert + expertsPerBlock;
 
-    unsigned firstGroup = blockIdx.x * expertsPerBlock;
+    unsigned firstGroup = blockIdx.x * expertsPerBlock; // test: blockIdx.x
     unsigned lastGroup = std::min(firstGroup + expertsPerBlock, numExpertsAndGroups);
 
     // STAGE 1: meta data
     for (unsigned group = firstGroup + threadIdx.x; group < lastGroup;
          group += gridDim.x * expertsPerBlock) {
+      // printf("threadIdx.x: %u, blockIdx.x: %u, rank: %u\n", threadIdx.x, blockIdx.x, rank);
+
       const uint32_t expert = group / numDPGroups;
 
       // Fetch the token count per DP, which is non-zero to indicate receipt.
@@ -235,9 +242,12 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void dispatchKernel(
       size_t numTokens = numTokensBuffer[group] - 1;
       nvshmem_uint64_wait_until(&numRecvBuffer[group], NVSHMEM_CMP_EQ, numTokens);
 
+      // temp buffer (clear numTokensBuffer)
       numTokensPerDP[group] = numTokens;
+      // clear after received
       numTokensBuffer[group] = 0;
       numRecvBuffer[group] = 0;
+      // shared memory
       sharedExpert[group - firstGroup] = atomicAdd(&outNumTokensPerExpert[expert], numTokens);
       sharedToken[group - firstGroup] = atomicAdd(&globalTokenIndex, numTokens);
     }
@@ -245,6 +255,10 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void dispatchKernel(
     __syncthreads();
 
     for (unsigned group = firstGroup; group < lastGroup; group++) {
+      // if (threadIdx.x == 0) {
+      //   printf("blockIdx.x: %u, rank: %u\n", blockIdx.x, rank);
+      // }
+
       const uint32_t expert = group / numDPGroups;
       const uint32_t dp = group % numDPGroups;
       const size_t numTokens = numTokensPerDP[group];
