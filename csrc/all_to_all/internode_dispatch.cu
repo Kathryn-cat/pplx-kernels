@@ -193,9 +193,11 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void dispatchKernel(
             const uint32_t dstRank = dstExpert / numLocalExperts;
             const uint32_t dstLocalExpert = dstExpert % numLocalExperts;
 
-            const uint32_t index = tokenIndex[dstExpert] - 1;
-            const uint32_t group = dstLocalExpert * numDPGroups + dpGroup;
-            const unsigned loc = group * maxNumTokens + index;
+            // TODO: shared memory
+            const uint32_t index = tokenIndex[dstExpert] - 1; // M offset
+            const uint32_t group =
+                dstLocalExpert * numDPGroups + dpGroup; // dstLocalExpert offset, dpGroup offset
+            const unsigned loc = group * maxNumTokens + index; // (N_LOCAL_EXPERTS, N_GROUP, M)
 
             std::byte *destPointer = xBufferOut + loc * tokenStride;
             nvshmemx_putmem_signal_nbi_warp( // key: PUT
@@ -221,7 +223,7 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void dispatchKernel(
   // RECV: Receiving tokens on the expert GPU from all other source GPUs.
   if constexpr (DO_RECV) {
     // Wait for the token counts to be sent.
-    const size_t numExpertsAndGroups = numLocalExperts * numDPGroups;                // test: 4
+    const size_t numExpertsAndGroups = numLocalExperts * numDPGroups; // N_LOCAL_EXPERTS, N_GROUP
     const size_t expertsPerBlock = ceil_div<size_t>(numExpertsAndGroups, gridDim.x); // test: 1
     uint32_t *sharedExpert = reinterpret_cast<uint32_t *>(sharedMemory);
     uint32_t *sharedToken = sharedExpert + expertsPerBlock;
@@ -231,7 +233,7 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void dispatchKernel(
 
     // STAGE 1: meta data
     for (unsigned group = firstGroup + threadIdx.x; group < lastGroup;
-         group += gridDim.x * expertsPerBlock) {
+         group += gridDim.x * expertsPerBlock) { // testing: just firstGroup + threadIdx.x
       // printf("threadIdx.x: %u, blockIdx.x: %u, rank: %u\n", threadIdx.x, blockIdx.x, rank);
 
       const uint32_t expert = group / numDPGroups;
@@ -265,7 +267,8 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void dispatchKernel(
       auto expertStart = sharedExpert[group - firstGroup];
       auto tokenStart = sharedToken[group - firstGroup];
 
-      for (unsigned i = threadIdx.x; i < numTokens; i += blockDim.x) {
+      for (unsigned i = threadIdx.x; i < numTokens;
+           i += blockDim.x) { // each thread responsible for one token
         std::byte *xTokenBuffer = xBufferOut + (group * maxNumTokens + i) * tokenStride;
         uint32_t token = tokenStart + i;
         sourceIndex[token] = *((uint32_t *)(xTokenBuffer + tokenDim));
@@ -281,7 +284,7 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void dispatchKernel(
 
     // STAGE 2: final copy
     for (unsigned i = blockIdx.x; i < numRecvTokens; i += gridDim.x) {
-      auto expertLoc = sourceOffset[i];
+      auto expertLoc = sourceOffset[i]; // consecutive
       auto expert = sourceExpert[i];
       auto group = expert * numDPGroups + sourceGroup[i];
 
