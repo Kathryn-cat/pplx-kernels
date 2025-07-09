@@ -60,6 +60,8 @@ float duration(cudaEvent_t start, cudaEvent_t end) {
   return ms;
 }
 
+// ----------------- generate test data and launch kernels -----------------
+
 template <typename Kernel, typename T, typename U, bool HAS_SCALE, typename... Args>
 std::tuple<Time, Time, Time, Time, Time, Time> benchConfig(
     const BenchConfig &config,
@@ -243,11 +245,14 @@ std::tuple<Time, Time, Time, Time, Time, Time> benchConfig(
       average(dispatchRecvTimeUs),
       average(combineTimeUs),
       average(combineSendTimeUs),
-      average(combineRecvTimeUs)};
+      average(combineRecvTimeUs)
+  };
 }
 
+// ---------------------------- end of kernel benchmark ----------------------------
+
 template <typename Kernel, typename T, typename U, bool HAS_SCALE, typename... Args>
-void benchmark(
+void benchmark( // call on four case
     const std::vector<BenchConfig> &configs,
     unsigned repeat,
     unsigned currentPE,
@@ -255,6 +260,7 @@ void benchmark(
     cudaStream_t stream,
     Args &&...args
 ) {
+  // for a vector of BenchConfigs, for each one run once
   for (const auto &config : configs) {
     auto [dispatch, dispatchSend, dispatchRecv, combine, combineSend, combineRecv] =
         benchConfig<Kernel, T, U, HAS_SCALE>(

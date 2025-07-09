@@ -18,7 +18,7 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void combineKernel(
     const float *weights,
     size_t weightsStrideElem,
     size_t weightsStrideRow,
-    const T *expertX,
+    const T *expertX, // IN
     size_t expertXStrideElem,
     size_t expertXStrideRow,
     size_t expertsPerToken,
@@ -37,7 +37,7 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void combineKernel(
     uint64_t *combineSignalBuffer,
     uint64_t *combineSyncBuffer,
     uint32_t &globalTokenIndex,
-    std::byte *xBufferIn,
+    std::byte *xBufferIn, // TMP
     std::byte *xBufferOut
 ) {
   const unsigned numLocalExperts = numExperts / worldSize;
@@ -47,12 +47,16 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void combineKernel(
 
   if (DO_SEND) {
     const size_t numSendTokens = __ldg(&globalTokenIndex);
+    // grid-wide barrier that synchronizes all participating GPUs (ranks) across the distributed
+    // system. Don't need to do so since we use sess._sync_all()
     for (unsigned i = blockIdx.x * blockDim.x + threadIdx.x; i < worldSize;
          i += gridDim.x * blockDim.x) {
       nvshmemx_signal_op(&combineSyncBuffer[rank], 1, NVSHMEM_SIGNAL_SET, i);
     }
 
     // Dispatch the tokens from the expert to the DP groups.
+    // ------------- begin of main for loop -------------
+    // each CTA sends one token
     for (uint32_t token = blockIdx.x; token < numSendTokens; token += gridDim.x) {
       const uint32_t expert = __ldg(&sourceExpert[token]);
       const uint32_t offset = __ldg(&sourceOffset[token]);
@@ -77,6 +81,7 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void combineKernel(
         __syncthreads();
       }
 
+      // signal the token to be sent.
       const uint32_t dstExpert = rank * numLocalExperts + expert;
 
       const uint32_t source = __ldg(&sourceIndex[token]);
@@ -90,6 +95,7 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void combineKernel(
         );
       }
     }
+    // ------------- end of main for loop -------------
   }
 
   // Synchronize the grid to ensure that tokens routed within the rank are
@@ -101,6 +107,7 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void combineKernel(
 
     // Compute the weighed sum of the input tokens.
     const size_t localNumTokens = boundM ? __ldg(boundM) : m;
+    // ------------- begin of main for loop -------------
     for (unsigned i = blockIdx.x; i < localNumTokens; i += gridDim.x) {
       nvshmem_uint64_wait_until(&combineSignalBuffer[i], NVSHMEM_CMP_EQ, expertsPerToken);
       __syncthreads();
@@ -116,6 +123,7 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void combineKernel(
           sum[l] = 0.0f;
         }
 
+        // --------------- inner for loop: sum calculation ---------------
         for (unsigned k = 0; k < expertsPerToken; ++k) {
           const uint32_t expert = __ldg(&indices[i * expertsPerToken + k]);
           const float weight = __ldg(&weights[i * weightsStrideRow + k]);
@@ -126,13 +134,15 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void combineKernel(
             sum[l] += weight * (float)((T *)xDstPtr)[j + l];
           }
         }
+        // --------------- end of inner for loop ---------------
 
 #pragma unroll
         for (unsigned l = 0; l < VEC_SIZE; ++l) {
-          dstPtr[j + l] = sum[l];
+          dstPtr[j + l] = sum[l]; // sum: vectorized
         }
       }
     }
+    // ------------- end of main for loop -------------
 
     for (unsigned i = blockIdx.x * blockDim.x + threadIdx.x; i < worldSize;
          i += gridDim.x * blockDim.x) {

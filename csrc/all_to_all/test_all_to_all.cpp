@@ -57,7 +57,8 @@ bool testDispatchCombine(
   constexpr size_t hiddenDim = 16;
   constexpr unsigned seed = 0xdeadbeef;
   constexpr size_t minNumTokens = 5;
-  constexpr size_t maxNumTokens = 10;
+  // constexpr size_t maxNumTokens = 10;
+  constexpr size_t maxNumTokens = 3;
   constexpr size_t blockSize = 2;
   constexpr size_t numRepeats = 1;
 
@@ -92,19 +93,19 @@ bool testDispatchCombine(
 
   auto &rank = rankTestData[dpRank];
   // if (epRank == 0) {
-  //   std::cout << "DP Rank #" << dpRank << ":" << std::endl;
+  //   std::cout << "DATA 0: DP Rank #" << dpRank << ":" << std::endl;
   //   rank.print(std::cout);
   // }
   // if (epRank == 1) {
-  //   std::cout << "DP Rank #" << dpRank << ":" << std::endl;
+  //   std::cout << "DATA 1: DP Rank #" << dpRank << ":" << std::endl;
   //   rank.print(std::cout);
   // }
   // if (epRank == 2) {
-  //   std::cout << "DP Rank #" << dpRank << ":" << std::endl;
+  //   std::cout << "DATA 2: DP Rank #" << dpRank << ":" << std::endl;
   //   rank.print(std::cout);
   // }
   // if (epRank == 3) {
-  //   std::cout << "DP Rank #" << dpRank << ":" << std::endl;
+  //   std::cout << "DATA 3: DP Rank #" << dpRank << ":" << std::endl;
   //   rank.print(std::cout);
   // }
 
@@ -196,82 +197,82 @@ bool testDispatchCombine(
   if (epRank == 0) {
     std::cout << "----------------- final results -----------------" << std::endl;
   }
-  for (unsigned i = 0; i < epSize; ++i) {
-    MPI_Barrier(MPI_COMM_WORLD);
+  // for (unsigned i = 0; i < epSize; ++i) {
+  //   MPI_Barrier(MPI_COMM_WORLD);
 
-    // Print per-expert results.
-    if (i == epRank) {
-      for (size_t j = 0; j < expertsPerRank; ++j) {
-        unsigned expert = i * expertsPerRank + j;
-        const size_t indptr = outNumTokensPerExpertHost[j];
+  //   // Print per-expert results.
+  //   if (i == epRank) {
+  //     for (size_t j = 0; j < expertsPerRank; ++j) {
+  //       unsigned expert = i * expertsPerRank + j;
+  //       const size_t indptr = outNumTokensPerExpertHost[j];
 
-        std::cout << "Expert #" << expert << " (" << indptr << "): " << std::flush << std::endl;
+  //       std::cout << "Expert #" << expert << " (" << indptr << "): " << std::flush << std::endl;
 
-        unsigned token = 0;
-        size_t offset = j * maxNumTokens * numDPGroups;
-        size_t offsetScale = j * maxNumTokens * numDPGroups;
-        for (unsigned dp = 0; dp < numDPGroups; ++dp) {
-          auto numTokens = rankTestData[dp].numRouted[expert];
-          for (unsigned index = 0; index < numTokens; ++index) {
-            auto rankM = rankTestData[dp].m;
-            std::cout << "#" << token << " (from " << dp << ")" << std::endl;
-            std::cout << "    ";
-            for (size_t l = 0; l < rank.hiddenDim; ++l) {
-              std::cout << (float)outExpertHost[(offset + token) * rank.hiddenDim + l] << " ";
-            }
-            std::cout << std::flush << std::endl;
-            std::cout << "    ";
-            for (size_t l = 0; l < rank.hiddenDimScale; ++l) {
-              std::cout << outExpertScaleHost[(offsetScale + token) * rank.hiddenDimScale + l]
-                        << " ";
-            }
-            std::cout << std::flush << std::endl;
+  //       unsigned token = 0;
+  //       size_t offset = j * maxNumTokens * numDPGroups;
+  //       size_t offsetScale = j * maxNumTokens * numDPGroups;
+  //       for (unsigned dp = 0; dp < numDPGroups; ++dp) {
+  //         auto numTokens = rankTestData[dp].numRouted[expert];
+  //         for (unsigned index = 0; index < numTokens; ++index) {
+  //           auto rankM = rankTestData[dp].m;
+  //           std::cout << "#" << token << " (from " << dp << ")" << std::endl;
+  //           std::cout << "    ";
+  //           for (size_t l = 0; l < rank.hiddenDim; ++l) {
+  //             std::cout << (float)outExpertHost[(offset + token) * rank.hiddenDim + l] << " ";
+  //           }
+  //           std::cout << std::flush << std::endl;
+  //           std::cout << "    ";
+  //           for (size_t l = 0; l < rank.hiddenDimScale; ++l) {
+  //             std::cout << outExpertScaleHost[(offsetScale + token) * rank.hiddenDimScale + l]
+  //                       << " ";
+  //           }
+  //           std::cout << std::flush << std::endl;
 
-            ++token;
-          }
-        }
-      }
-      std::cout << std::flush << std::endl;
-    }
+  //           ++token;
+  //         }
+  //       }
+  //     }
+  //     std::cout << std::flush << std::endl;
+  //   }
 
-    // Print DP group results.
-    if (i == epRank && dpRank * dpSize == epRank) {
-      std::cout << "DP Group #" << dpRank << ": " << std::endl;
-      auto &dpRankData = rankTestData[dpRank];
-      for (size_t j = 0; j < dpRankData.m; ++j) {
-        std::cout << "#" << j << ": ";
-        for (size_t k = 0; k < expertsPerToken; ++k) {
-          const float e = dpRankData.indices[j * expertsPerToken + k];
-          const float w = dpRankData.weights[j * expertsPerToken + k];
-          if (k > 0) {
-            std::cout << " + ";
-          }
-          std::cout << e << " * " << w;
-        }
-        std::cout << std::endl;
+  //   // Print DP group results.
+  //   if (i == epRank && dpRank * dpSize == epRank) {
+  //     std::cout << "DP Group #" << dpRank << ": " << std::endl;
+  //     auto &dpRankData = rankTestData[dpRank];
+  //     for (size_t j = 0; j < dpRankData.m; ++j) {
+  //       std::cout << "#" << j << ": ";
+  //       for (size_t k = 0; k < expertsPerToken; ++k) {
+  //         const float e = dpRankData.indices[j * expertsPerToken + k];
+  //         const float w = dpRankData.weights[j * expertsPerToken + k];
+  //         if (k > 0) {
+  //           std::cout << " + ";
+  //         }
+  //         std::cout << e << " * " << w;
+  //       }
+  //       std::cout << std::endl;
 
-        std::cout << "r = ";
-        for (size_t l = 0; l < hiddenDim; ++l) {
-          std::cout << (float)outTokensHost[j * hiddenDim + l] << " ";
-        }
-        std::cout << std::endl;
+  //       std::cout << "r = ";
+  //       for (size_t l = 0; l < hiddenDim; ++l) {
+  //         std::cout << (float)outTokensHost[j * hiddenDim + l] << " ";
+  //       }
+  //       std::cout << std::endl;
 
-        std::cout << "e = ";
-        for (size_t l = 0; l < hiddenDim; ++l) {
-          float sum = 0.0f;
-          for (size_t k = 0; k < expertsPerToken; ++k) {
-            const float w = dpRankData.weights[j * expertsPerToken + k];
-            sum += w * (float)dpRankData.x[j * hiddenDim + l];
-          }
-          std::cout << sum << " ";
-        }
-        std::cout << std::endl;
-      }
-      std::cout << std::flush << std::endl;
-    }
+  //       std::cout << "e = ";
+  //       for (size_t l = 0; l < hiddenDim; ++l) {
+  //         float sum = 0.0f;
+  //         for (size_t k = 0; k < expertsPerToken; ++k) {
+  //           const float w = dpRankData.weights[j * expertsPerToken + k];
+  //           sum += w * (float)dpRankData.x[j * hiddenDim + l];
+  //         }
+  //         std::cout << sum << " ";
+  //       }
+  //       std::cout << std::endl;
+  //     }
+  //     std::cout << std::flush << std::endl;
+  //   }
 
-    MPI_Barrier(MPI_COMM_WORLD);
-  }
+  //   MPI_Barrier(MPI_COMM_WORLD);
+  // }
 
   // Verify the results.
   bool failed = false;

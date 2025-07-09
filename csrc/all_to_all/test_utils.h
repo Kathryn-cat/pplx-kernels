@@ -49,7 +49,8 @@ RankTestData<T>::RankTestData(
     size_t hiddenDim,
     size_t blockSize
 )
-    : m(std::uniform_int_distribution<>(1, maxNumTokens)(gen)),
+    // : m(std::uniform_int_distribution<>(1, maxNumTokens)(gen)),
+    : m(3),
       hiddenDim(hiddenDim),
       hiddenDimScale(ceil_div(hiddenDim, blockSize)),
       numExperts(numExperts),

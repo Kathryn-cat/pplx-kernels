@@ -225,6 +225,7 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void dispatchKernel(
     // Wait for the token counts to be sent.
     const size_t numExpertsAndGroups = numLocalExperts * numDPGroups; // N_LOCAL_EXPERTS, N_GROUP
     const size_t expertsPerBlock = ceil_div<size_t>(numExpertsAndGroups, gridDim.x); // test: 1
+
     uint32_t *sharedExpert = reinterpret_cast<uint32_t *>(sharedMemory);
     uint32_t *sharedToken = sharedExpert + expertsPerBlock;
 
@@ -232,6 +233,12 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void dispatchKernel(
     unsigned lastGroup = std::min(firstGroup + expertsPerBlock, numExpertsAndGroups);
 
     // STAGE 1: meta data
+    // total number of groups: numLocalExperts * numDPGroups
+    // we want to scatter among CTAs as evenly as possible
+    // each group can be received by one thread
+    // each CTA: responsible for at most expertsPerBlock groups
+    // each thread: responsible for one group
+    // my argument: #threads in a CTA (320) >> expertsPerBlock
     for (unsigned group = firstGroup + threadIdx.x; group < lastGroup;
          group += gridDim.x * expertsPerBlock) { // testing: just firstGroup + threadIdx.x
       // printf("threadIdx.x: %u, blockIdx.x: %u, rank: %u\n", threadIdx.x, blockIdx.x, rank);
@@ -250,12 +257,16 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void dispatchKernel(
       numTokensBuffer[group] = 0;
       numRecvBuffer[group] = 0;
       // shared memory
-      sharedExpert[group - firstGroup] = atomicAdd(&outNumTokensPerExpert[expert], numTokens);
-      sharedToken[group - firstGroup] = atomicAdd(&globalTokenIndex, numTokens);
+      sharedExpert[group - firstGroup] =
+          atomicAdd(&outNumTokensPerExpert[expert], numTokens);                  // smem per CTA
+      sharedToken[group - firstGroup] = atomicAdd(&globalTokenIndex, numTokens); // smem per CTA
     }
 
     __syncthreads();
 
+    // each CTA is responsible for at most expertsPerBlock groups
+    // loop through the groups sequentially
+    // for each group, use one thread to process one token
     for (unsigned group = firstGroup; group < lastGroup; group++) {
       // if (threadIdx.x == 0) {
       //   printf("blockIdx.x: %u, rank: %u\n", blockIdx.x, rank);
@@ -264,8 +275,8 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void dispatchKernel(
       const uint32_t expert = group / numDPGroups;
       const uint32_t dp = group % numDPGroups;
       const size_t numTokens = numTokensPerDP[group];
-      auto expertStart = sharedExpert[group - firstGroup];
-      auto tokenStart = sharedToken[group - firstGroup];
+      auto expertStart = sharedExpert[group - firstGroup]; // atomic counter, index 0
+      auto tokenStart = sharedToken[group - firstGroup];   // atomic counter, index 0
 
       for (unsigned i = threadIdx.x; i < numTokens;
            i += blockDim.x) { // each thread responsible for one token
@@ -280,20 +291,40 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void dispatchKernel(
     }
 
     cooperative_groups::this_grid().sync();
-    unsigned numRecvTokens = globalTokenIndex;
+    unsigned numRecvTokens =
+        globalTokenIndex; // total numRecvTokens on this rank across (local_experts, dp_group)
+
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+      printf("-----------rank: %u, numRecvTokens: %u------------\n", rank, numRecvTokens);
+      for (int i = 0; i < numRecvTokens; i++) {
+        printf(
+            "i: %u, token: %u, expert: %u, index: %u, offset: %u, group: %u\n",
+            i,
+            sourceToken[i],
+            sourceExpert[i],
+            sourceIndex[i],
+            sourceOffset[i],
+            sourceGroup[i]
+        );
+      }
+      printf("------------------------------------------------\n");
+    }
+    cooperative_groups::this_grid().sync();
 
     // STAGE 2: final copy
+    // assign each recv token to a CTA
     for (unsigned i = blockIdx.x; i < numRecvTokens; i += gridDim.x) {
-      auto expertLoc = sourceOffset[i]; // consecutive
+      auto expertLoc = sourceOffset[i]; // consecutively stored
       auto expert = sourceExpert[i];
       auto group = expert * numDPGroups + sourceGroup[i];
 
       std::byte *xTokenBuffer = xBufferOut + (group * maxNumTokens + sourceToken[i]) * tokenStride;
-      std::byte *dstXExpert = expertX + expert * expertXStrideRow;
+      std::byte *dstXExpert =
+          expertX + expert * expertXStrideRow; // hiddenDimBytes * maxNumTokens * numDPGroups
       float *dstXScaleExpert = expertXScale + expert * expertXScaleStrideCol;
 
       const int4 *srcX = (int4 *)xTokenBuffer;
-      int4 *dstX = (int4 *)(dstXExpert + expertLoc * expertXStrideElem);
+      int4 *dstX = (int4 *)(dstXExpert + expertLoc * expertXStrideElem); // hiddenDimBytes
       for (unsigned k = threadIdx.x; k * sizeof(int4) < hiddenDim; k += blockDim.x) {
         dstX[k] = srcX[k];
       }
@@ -331,12 +362,12 @@ void AllToAllInterNode::dispatch(
       ),
       static_cast<unsigned>(numSMs)
   );
-  printf("numBlocks: %u\n", numBlocks);
+  // printf("numBlocks: %u\n", numBlocks);
   dim3 dimGrid(numBlocks, 1, 1);
   dim3 dimBlock(NUM_WARPS * 32, 1, 1);
 
   const size_t expertsPerBlock = ceil_div<size_t>(numLocalExperts * numDPGroups, numBlocks);
-  printf("expertsPerBlock: %zu\n", expertsPerBlock);
+  // printf("expertsPerBlock: %zu\n", expertsPerBlock);
   const size_t sharedMemorySend = sizeof(uint32_t) * numExperts;
   const size_t sharedMemoryRecv = sizeof(uint32_t) * expertsPerBlock;
 
@@ -404,7 +435,7 @@ void AllToAllInterNode::dispatch(
     ));
     break;
   case SplitMode::NONE:
-    printf("SplitMode::NONE\n");
+    // printf("SplitMode::NONE\n");
     CUDACHECK(cudaLaunchCooperativeKernel(
         (void *)&dispatchKernel<NUM_WARPS, true, true>,
         dimGrid,
